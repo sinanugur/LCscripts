@@ -1,0 +1,1150 @@
+---
+title: "Lung cancer modelling functions, options and packages"
+author: "Sinan U. Umu"
+date: '02/01/2020 (updated: `r format(Sys.Date(),"%d/%m/%Y")`)'
+output:
+  html_document:
+    highlight: default
+    theme: united
+    toc: yes
+    toc_depth: 2
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T)
+```
+
+
+***
+###  Packages
+```{r load packages,message=FALSE,warning=FALSE,eval=FALSE}
+require(tidytext)
+require(DESeq2)
+require(xgboost)
+require(glmnetUtils)
+require(future)
+require(sglfast) #sglfast https://github.com/jlaria/sglfast
+require(msgl) #another group lasso package https://github.com/nielsrhansen/msgl
+require(sglOptim)
+require(pROC)
+require(caret)
+require(plotROC)
+require(parallel)
+require(optmatch) #optimal matching cases and controls
+require(doParallel)
+#require(SGL) #sparse group lasso package
+require(tidyverse)
+
+```
+
+***
+### Introduction
+I use functional programming so I put model training and testing steps into seperate functions. This is also useful when changing parameters and searching the grid which I will show.
+
+I added comments to mark checkpoints so you can follow the important steps. I call some other helper functions which I have not added into this code to prevent confusion. I think they are not directly relavent.
+
+***
+
+### Functions
+
+This function is to train sparse group lasso model using **sglfast** package.
+
+SGL fast paper https://www.tandfonline.com/doi/full/10.1080/10618600.2019.1573687
+
+```{r function define sglfast - sparse group lasso model}
+
+
+#take normalized RNA counts and strata information and train the model
+function_train_sparse_group_lasso_model_using_sglfast=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=2,seed=255,type_index= TRUE,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,matched_variables_=c("BDg","age_continuous","sex")) {
+  
+  
+
+##Select and find clinical features e.g. age, sex, BDg
+#merge dataset with normalized RNA expression
+model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+##Select appropriate cases
+# with correct stage, histology and prediagnostic time
+data_df = model_data_df %>% filter((diagnosetimeinyears >= t1 & diagnosetimeinyears < t2 ) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+
+
+##1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+
+filter_vector_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1,matched_variables = matched_variables_) %>% .$filter_vector_df %>% data.frame(groups=.,rows=names(.))
+
+##Divide the dataset into three equal parts, tranining, validation and test
+#SGL fast requires training and validation datasets
+#SGL fast paper https://www.tandfonline.com/doi/full/10.1080/10618600.2019.1573687
+
+data_df = data_df %>% bind_cols(filter_vector_df) %>% filter(!is.na(groups)) %>% mutate(dataset=function_data_split(groups,ratio = c(.6,.2,.2),seed = seed))
+model_training_df=data_df %>% filter(dataset %in% "training") %>% dplyr::select(-(groups:dataset))
+model_test_df=data_df %>% filter(dataset %in% "testing") %>% dplyr::select(-(groups:dataset))
+model_validate_df=data_df %>% filter(dataset %in% "validate") %>% dplyr::select(-(groups:dataset))
+
+
+#pull out the feature names i.e. RNA IDs for later use
+selected_variables = model_training_df %>% select(-(sample:age_continuous)) %>% names()
+
+##Prepare training, validation and test datasets for sglfast main function.
+data_=list(x=model_training_df %>% dplyr::select(selected_variables) %>% as.matrix(),y=model_training_df %>% dplyr::select(condition) %>% mutate(condition = as.numeric(condition) -1) %>% as.matrix())
+validate_=list(x=model_validate_df %>% dplyr::select(selected_variables) %>% as.matrix(),y=model_validate_df %>% dplyr::select(condition) %>% mutate(condition = as.numeric(condition) -1) %>% as.matrix())
+test_=list(x=model_test_df %>% dplyr::select(selected_variables) %>% as.matrix(),y=model_test_df %>% dplyr::select(condition) %>% mutate(condition = as.numeric(condition) -1) %>% as.matrix())
+
+
+##Assign groups to RNA features.
+#By default RNAs will be assigned
+ids=model_training_df %>% dplyr::select(selected_variables) %>% colnames()
+if(type_index== TRUE) {
+  index_= rna_ids_types %>% filter(ID %in% ids) %>% arrange(match(ID,ids)) %>% pull(Type) %>% as.factor() %>% as.numeric() 
+  
+} else {
+    
+  index_=1:length(c(ids))
+}
+
+##train logistic the model using sglfast
+isgl.fit = sglfast::isgl(data_, validate_, index = index_, type = "logit",standardize = T)
+
+##predict on test dataset
+predict_=predict.isgl(isgl.fit,test_$x) %>% as.data.frame() %>% rename(LC=1)
+
+##build a ROC curve and calculate AUC
+rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition) %>% dplyr::mutate(prob=predict_$LC),direction="<")
+
+##create a confusion matrix
+prediction_class=factor(ifelse(predict_$LC > 0.5,"LC","C"),levels=c("LC","C"))
+confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=c("LC","C")))
+
+return(list(fit=isgl.fit,confusion=confusion,training=model_training_df,validate=model_validate_df,test=model_test_df,rocfit=rocfit_,predict=predict_,d=data_,t=test_,v=validate_,data=data_df,groups=index_))
+}
+
+
+```
+
+***
+
+This function is to train sparse group lasso model using **msgl** package.
+
+```{r function define msgl - sparse group lasso model}
+
+#take normalized RNA counts and strata information and train the model
+function_train_sparse_group_lasso_model=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=10,seed=255,type_index= TRUE,alpha=0.5,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull),matched_variables_=c("BDg","age_continuous","sex")) {
+  
+  
+  type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+# filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1)
+filter_vector_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1,matched_variables=matched_variables_) %>% .$filter_vector_df %>% data.frame(groups=.,rows=names(.))
+
+## Divide the dataset into two parts, tranining and test %70 training and %30 test
+# SGL fast requires training and validation datasets
+# SGL fast paper https://www.tandfonline.com/doi/full/10.1080/10618600.2019.1573687
+
+data_df = data_df %>% bind_cols(filter_vector_df) %>% filter(!is.na(groups)) %>% dplyr::mutate(dataset=function_data_split(groups,ratio = c(.7,0,.3),seed = seed))
+
+
+model_training_df=data_df %>% filter(dataset %in% "training") %>% dplyr::select(-(groups:dataset))
+model_test_df=data_df %>% filter(dataset %in% "testing") %>% dplyr::select(-(groups:dataset))
+
+selected_variables = model_training_df %>% dplyr::select(-(sample:age_continuous)) %>% names()
+  
+##Assign groups to RNA features.
+#By default RNAs will be assigned to RNA type
+ids=model_training_df %>% dplyr::select(selected_variables) %>% colnames()
+if(type_index== TRUE) {
+  index_= rna_ids_types %>% filter(ID %in% ids) %>% arrange(match(ID,ids)) %>% pull(Type) %>% as.factor() %>% as.numeric() 
+  
+} else {
+    
+  index_=1:length(c(ids))
+}
+  
+    
+  
+  train_=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix()
+  rownames(train_) = model_training_df %>% pull(sample)
+  
+  test_=model_test_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix()
+  rownames(test_) = model_test_df %>% pull(sample)
+  
+  train_classes=model_training_df %>% pull(condition)
+  names(train_classes)=model_training_df %>% pull(sample)
+  
+  test_classes=model_test_df %>% pull(condition)
+  names(test_classes)=model_test_df %>% pull(sample)
+  
+  
+  
+  #alpha = 1 for lasso, alpha = 0 for group lasso and alpha in the range (0,1) for sparse group lasso.
+  fit.cv=msgl::cv(train_,train_classes,grouping = index_,fold = 5,alpha = alpha,lambda = 0.01,use_parallel = T,standardize = T)
+  
+  fit.msgl=msgl::fit(train_,train_classes,grouping = index_,alpha = alpha,lambda = 0.01,standardize = T)
+  
+  predict_=predict(fit.msgl,test_)
+  
+  probs_=predict_$response[[sglOptim::best_model(fit.cv)]]["LC",]
+  
+  
+  rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition,one_of(selected_variables)) %>% mutate(prob=probs_),direction="<")
+  
+  rocfit_
+  
+  prediction_class=factor(ifelse(probs_ > 0.5,"LC","C"),levels=c("LC","C"))
+  
+  confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=c("LC","C")))
+  
+  return(list(model=fit.cv,model_fit=fit.msgl,confusion=confusion,rocfit=rocfit_,predict=predict_))
+}
+
+
+
+```
+
+
+***
+
+This function is to train glmnet model using **caret** package.
+
+
+```{r function define caret glmnet}
+
+#take normalized RNA counts and strata information and train the model
+function_train_caret_models=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),method="glmnet",feature_select = FALSE,t1=0,t2=3,seed=255,test_baseline_model=FALSE,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,tunelength=200,type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull),features_to_include=c(),levels=c("LC","C"),matched_variables=c("BDg","age_continuous","sex")) {
+  
+  
+  
+  type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1,matched_variables = matched_variables) %>% .$filter_df
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+
+  
+  ## Prefeature selection is optional, by default I selected genetic algorithm feature selection
+  # details are here https://topepo.github.io/caret/feature-selection-overview.html
+  ga_ctrl= gafsControl(functions = rfGA,method = "LOOCV",allowParallel = T,verbose = T)
+  if (feature_select == TRUE) {
+    set.seed(seed)
+    print("Feature Select")
+    feature_selection <- gafs(model_training_df %>% dplyr::select(-(sample:age_continuous)), model_training_df$condition, gafsControl =ga_ctrl)
+    
+    selected_variables = feature_selection$optVariables #this is a vector
+    
+  } else {
+    
+    feature_selection=NULL
+    if(isTRUE(test_baseline_model)) {
+      selected_variables = c("age_continuous")
+    } else if(is.null(features_to_include) & isFALSE(feature_select)) {
+  selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()    
+  
+  } else if(isFALSE(feature_select)) {
+    
+    selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(one_of(features_to_include)) %>% names() 
+    
+  }}
+  
+  
+  #5 fold repeated CV to fit the model
+  ctrl <- caret::trainControl(method = "repeatedcv", 
+                              number = 5, #10 before
+                              repeats = 5, #10 before
+                              verboseIter = T,
+                              summaryFunction = twoClassSummary,
+                              classProbs = T,
+                              #sampling = "up",
+                              allowParallel = T,
+                              search = "random",
+                              savePredictions = F,
+                              trim = T
+  )
+  
+
+  
+  set.seed(seed)
+  model_rf_rose <- caret::train(condition ~ . ,
+                                data = model_training_df %>% dplyr::select(condition,one_of(selected_variables)),
+                                method = method, #default glmnet
+                                preProcess = c("scale", "center"),
+                                trControl = ctrl,
+                                #importance="permutation",
+                                #importance=NA,
+                                metric="ROC",
+                                tuneLength=tunelength #100
+                                
+  )
+  
+  predict_=predict(model_rf_rose,model_test_df %>% dplyr::select(condition,one_of(selected_variables)),type=c("prob"))
+  
+  
+  rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition,one_of(selected_variables)) %>% mutate(prob=predict_$OC),direction="<")
+  
+  
+  
+  prediction_class=factor(ifelse(predict_$OC > 0.5,levels[1],levels[2]),levels=levels)
+  
+  
+  confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=levels))
+  
+  return(list(model=model_rf_rose,confusion=confusion,training=model_training_df,test=model_test_df,feature=feature_selection,rocfit=rocfit_,predict=predict_))
+}
+
+
+
+```
+
+```{r function define caret glm}
+
+#take normalized RNA counts and strata information and train the model
+function_train_caret_glm=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),method="glmStepAIC",feature_select = FALSE,t1=0,t2=3,seed=255,test_baseline_model=FALSE,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,tunelength=200,type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull)) {
+  
+  
+  
+  type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1) %>% .$filter_df
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+
+  
+  ## Prefeature selection is optional, by default I selected genetic algorithm feature selection
+  # details are here https://topepo.github.io/caret/feature-selection-overview.html
+  ga_ctrl= gafsControl(functions = rfGA,method = "LOOCV",allowParallel = T,verbose = T)
+  rf_ctrl <- rfeControl(method = "LOOCV",allowParallel = T,verbose = T)
+  
+  rf_ctrl <- rfeControl(
+                  #rerank = T,
+                   method = "repeatedcv",
+                   repeats = 2,
+                   number = 4,
+                   verbose = T, 
+                   allowParallel = T)
+  if (feature_select == TRUE) {
+    set.seed(seed)
+    print("Feature Select")
+    #feature_selection <- gafs(model_training_df %>% dplyr::select(-(sample:age_continuous)), model_training_df$condition, gafsControl =ga_ctrl)
+    feature_selection <- rfe(model_training_df %>% dplyr::select(-(sample:sex)), model_training_df %>% dplyr::select(condition) %>% .$condition,                      rfeControl = rf_ctrl)
+    
+    selected_variables = feature_selection$optVariables #this is a vector
+    
+  } else {
+    
+    feature_selection=NULL
+    if(isFALSE(test_baseline_model)) {
+    selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()  
+    } else {
+      
+      selected_variables = c("age_continuous")
+    }
+    
+  }
+  
+  model_training_df= model_training_df %>% dplyr::select(condition,selected_variables) %>% dplyr::rename_all(function(x) paste0("X",x)) %>% dplyr::rename(condition=1)
+  model_test_df= model_test_df %>% dplyr::select(condition,selected_variables) %>% dplyr::rename_all(function(x) paste0("X",x)) %>% dplyr::rename(condition=1)
+  
+  #5 fold repeated CV to fit the model
+  ctrl <- caret::trainControl(method = "repeatedcv", 
+                              number = 5, #10 before
+                              repeats = 5, #10 before
+                              verboseIter = T,
+                              summaryFunction = twoClassSummary,
+                              classProbs = T,
+                              #sampling = "up",
+                              allowParallel = T,
+                              search = "random",
+                              savePredictions = F,
+                              trim = T
+  )
+  
+
+  
+  set.seed(seed)
+  model_rf_rose <- caret::train(condition ~ . ,
+                                data = model_training_df,
+                                method = method, #default glmnet
+                                preProcess = c("scale", "center"),
+                                trControl = ctrl,
+                                #importance="permutation",
+                                #importance=NA,
+                                metric="ROC",
+                                tuneLength=tunelength, #100
+                                #direction="forward",
+                                MaxNWts=100000
+
+                                
+  )
+  
+  predict_=predict(model_rf_rose,model_test_df,type=c("prob"))
+  
+  
+  rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% mutate(prob=predict_$LC),direction="<")
+  
+  
+  
+  prediction_class=factor(ifelse(predict_$LC > 0.5,"LC","C"),levels=c("LC","C"))
+  
+  confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=c("LC","C")))
+  
+  return(list(model=model_rf_rose,confusion=confusion,training=model_training_df,test=model_test_df,feature=feature_selection,rocfit=rocfit_,predict=predict_))
+}
+
+
+
+```
+
+
+```{r function define caret rf}
+
+#take normalized RNA counts and strata information and train the model
+function_train_caret_rf=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),method="rf",t1=0,t2=3,seed=255,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull)) {
+  
+  
+  
+    type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1) %>% .$filter_df
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+
+  
+
+    selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()  
+
+
+  
+  ctrl_rf=caret::trainControl(method = "repeatedcv",
+                           number = 10, #10
+                           repeats = 5, #5
+                           summaryFunction = twoClassSummary,
+                           classProbs = T,
+                           allowParallel = TRUE)
+  
+  mtry=ceiling(sqrt(length(selected_variables) -1))
+  tunegrid=expand.grid(.mtry=mtry)
+  set.seed(seed)
+  model_rf_rose <- caret::train(condition ~ . ,
+                                data = model_training_df %>% dplyr::select(condition,one_of(selected_variables)),
+                                method = method, #default glmnet
+                                preProcess = c("scale", "center"),
+                                trControl = ctrl_rf,
+                                metric="ROC",
+                                tuneGrid = tunegrid
+                                
+  )
+  
+  predict_=predict(model_rf_rose,model_test_df %>% dplyr::select(condition,one_of(selected_variables)),type=c("prob"))
+  
+  
+  rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition,one_of(selected_variables)) %>% mutate(prob=predict_$LC),direction="<")
+  
+  
+  
+  prediction_class=factor(ifelse(predict_$LC > 0.5,"LC","C"),levels=c("LC","C"))
+  
+  confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=c("LC","C")))
+  
+  return(list(model=model_rf_rose,confusion=confusion,training=model_training_df,test=model_test_df,rocfit=rocfit_,predict=predict_))
+}
+
+
+
+```
+
+
+```{r function define glmnet}
+
+#take normalized RNA counts and strata information and train the model
+function_train_glmnet=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=10,seed=255,cv=20,alphas=seq(0,1,len=11)^3,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull)) {
+  
+  
+  
+    type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1) %>% .$filter_df
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+
+  
+  selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()  
+    
+  
+  names(alphas)=paste0("alpha_",alphas)
+  
+  #5 fold repeated CV to fit the model
+  set.seed(seed)
+  #glmnet.cva=glmnetUtils::cva.glmnet(x=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = 5,family = "binomial", type.measure = "auc")
+  
+  list_of_fits=alphas %>% map(~glmnetUtils::cv.glmnet(x=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = cv,family = "binomial",alpha=.x, type.measure = "auc",parallel = T))
+  
+  
+  #predict_=predict(glmnet.cva,model_test_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix() ,alpha=best_alpha,which=match(TRUE,abs(glmnet.cva$alpha-best_alpha) < 1e-08),type=c("response"))
+  list_of_predicts=list_of_fits %>% map(~predict(.x,model_test_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),s=.x$lambda.1se,type=c("response")))
+  
+  
+  list_of_rocfits=list_of_predicts %>% map(~pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition,one_of(selected_variables)) %>% mutate(prob=.x[,1]),direction="<"))
+  
+  index=list_of_rocfits %>% map(~.x$auc %>% as.numeric) %>% unlist() %>% which.max()
+  
+  
+  prediction_class=factor(ifelse(list_of_predicts[[index]][,1] > 0.5,"LC","C"),levels=c("LC","C"))
+  
+  confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=c("LC","C")))
+  
+  return(list(model=list_of_fits[[index]],confusion=confusion,rocfit=list_of_rocfits[[index]],predict=list_of_predicts[[index]],alphas=list_of_rocfits,models=list_of_fits))
+  
+}
+
+
+
+```
+
+
+```{r function define randomforest}
+
+#take normalized RNA counts and strata information and train the model
+function_train_randomforest=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=10,seed=255,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull)) {
+  
+  
+    type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1) %>% .$filter_df
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+
+  
+  selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()  
+    
+  
+    #5 fold repeated CV to fit the model
+  set.seed(seed)
+  #glmnet.cva=glmnetUtils::cva.glmnet(x=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = 5,family = "binomial", type.measure = "auc")
+  
+  
+  
+  #predict_=predict(glmnet.cva,model_test_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix() ,alpha=best_alpha,which=match(TRUE,abs(glmnet.cva$alpha-best_alpha) < 1e-08),type=c("response"))
+  #model= randomForest::randomForest(condition ~ . , data=model_training_df %>% dplyr::select(condition,one_of(selected_variables)) %>% dplyr::rename_all(function(x) paste0("X",x)) %>% dplyr::rename(condition=1),importance=T,proximity=T,ntree=1000)
+  
+  model=randomForest::tuneRF(model_training_df %>% select(-(sample:age_continuous)),model_training_df %>% pull(condition),ntreeTry =500,doBest = T,importance=T,proximity=T,plot = F)
+  
+predict_=predict(model,model_test_df %>% select(-(sample:age_continuous)),type=c("prob"))
+  
+  
+  rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition,one_of(selected_variables)) %>% mutate(prob=predict_[,"LC"]),direction="<")
+  
+  
+  
+  prediction_class=factor(ifelse(predict_[,"LC"] > 0.5,"LC","C"),levels=c("LC","C"))
+  
+  confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=c("LC","C")))
+  
+  return(list(model=model,confusion=confusion,training=model_training_df,test=model_test_df,rocfit=rocfit_,predict=predict_))
+  
+}
+
+
+
+```
+
+
+```{r}
+function_train_independent_survival_models=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),main_clinical_df=lc_main_clinical_smoking_updated_df,cut_off=10) {
+
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% mutate(status = ifelse(diagnosetimeinyears >cut_off,0,1)) %>% mutate(time = ifelse(diagnosetimeinyears > cut_off,cut_off + 0.1,diagnosetimeinyears))
+  
+  data_df = model_data_df %>% filter(cancertype %in% cancertype_,metastase %in% stage_)
+  
+
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1) %>% .$filter_df
+  
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+
+  
+
+model_c=data_df %>% group_by(ID) %>% do(broom::tidy(coxph(Surv(time,status) ~ vst + BDg + sex + age_continuous,.))) %>% group_by(term) %>% mutate(padj=p.adjust(p.value)) %>% arrange(padj)
+
+#model_c=data_df %>% mutate(sex=as.numeric(sex),BDg=as.numeric(BDg)) %>% filter(ID == "RN7SL8P") %>% group_by(ID) %>% do(result=list(rfsrc(Surv(time,status) ~ vst + BDg + sex + age_continuous,.)))
+#model_a=model_training_df %>% group_by(ID) %>% do(broom::tidy(coxph(Surv(time,status) ~ vst + BDg + sex + age_continuous,.)))
+  
+return(list(modelrf=model_c))
+
+}
+
+
+```
+
+
+```{r}
+function_train_boosting_model=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=10,seed=255,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,early_stopping_rounds = 700,nrounds=1000,subsample=0.55,colsample_bytree=1,eta=0.01,max.depth=10,matched_variables=c("BDg","age_continuous","sex"),type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull),features_to_include=c(),levels=c("LC","C"),feature_select=F,alpha=0,gamma=0,lambda=1,min_child_weight=1) {
+  
+  type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,bmi,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,bmi,age_continuous),controls = 1,matched_variables = matched_variables) %>% .$filter_df
+  
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+#return(list(training=model_training_df,test=model_test_df))
+  
+  if(is.null(features_to_include) & isFALSE(feature_select)) {
+  selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()    
+  
+  } else if(isFALSE(feature_select)) {
+    
+    selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(one_of(features_to_include)) %>% names() 
+    
+  } else {
+    
+      set.seed(seed)
+  #glmnet.cva=glmnetUtils::cva.glmnet(x=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = 5,family = "binomial", type.measure = "auc")
+  
+  modelf=glmnetUtils::cv.glmnet(x=model_training_df %>% dplyr::select(-(sample:age_continuous)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = 20,family = "binomial",alpha=1, type.measure = "auc",parallel = T)
+  
+  
+  
+  selected_variables=coef(modelf,s="lambda.1se") %>% as.matrix() %>% as.data.frame() %>% rownames_to_column("ID") %>% select(ID,value=2) %>% filter(value != 0,ID != "(Intercept)") %>% pull(ID)
+  print(selected_variables)
+  
+  }
+  
+    
+
+
+
+#datatrain=model_training_df %>% dplyr::select(condition,selected_variables) %>% dplyr::rename_all(function(x) paste0("X",x)) %>% dplyr::rename(condition=1)
+
+#datatest=  model_test_df %>% dplyr::select(condition,selected_variables) %>% dplyr::rename_all(function(x) paste0("X",x)) %>% dplyr::rename(condition=1)
+
+#traintask <- mlr::makeClassifTask(data = datatrain,target = "condition")
+#testtask <- mlr::makeClassifTask(data = datatest,target = "condition")
+
+#lrn <- mlr::makeLearner("classif.xgboost",predict.type = "prob")
+#lrn$par.vals <- list(    objective="binary:logistic",    eval_metric="auc",    nrounds=50)
+
+#params <- makeParamSet(    makeDiscreteParam("booster",values = c("gbtree")),    makeIntegerParam("max_depth",lower = 3L,upper = 20),   makeNumericParam("min_child_weight",lower = 1L,upper = 10L),    makeNumericParam("subsample",lower = 0.4,upper = 0.7), makeNumericParam("eta",lower = 0.001,upper = 0.3),    makeNumericParam("colsample_bytree",lower = 0.5,upper = 0.7))
+
+#rdesc <- makeResampleDesc("CV",stratify = T,iters=6)
+#ctrl <- makeTuneControlRandom(maxit = 15)
+#mytune <- tuneParams(learner = lrn                     ,task = traintask                     ,resampling = rdesc                     ,measures = auc                     ,par.set = params                     ,control = ctrl                     ,show.info = T)
+
+#lrn_tune=setHyperPars(lrn,par.vals = mytune$x)
+
+#model=mlr::train(learner = lrn_tune,task = traintask)
+#predict_=predict(model,testtask)
+
+  
+dtrain=xgboost::xgb.DMatrix(data=model_training_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(selected_variables) %>% as.matrix(),label = as.numeric(model_training_df$condition) - 1)
+dtest=xgboost::xgb.DMatrix(data=model_test_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(selected_variables)  %>% as.matrix(),label = as.numeric(model_test_df$condition) - 1)
+watchlist = list(train=dtrain,test=dtest)
+#set.seed(seed)
+#bstSparse= xgboost::xgb.train(data=dtrain,max.depth=10,nrounds = 1000,eta=0.01,eval_metric="auc",watchlist = watchlist,subsample=0.4,seed=seed,objective = "binary:logistic",nthread=15,maximize = T)
+
+#cv= xgboost::xgb.cv(data=dtrain,nrounds = nrounds,eval_metric="auc",objective = "binary:logistic",nthread=15,nfold = 5,eta=0.01,max.depth=20)
+
+set.seed(seed)
+model= xgboost::xgb.train(data=dtrain,max.depth=max.depth,nrounds = nrounds,eta=eta,eval_metric="auc",watchlist = watchlist,subsample=subsample,objective = "binary:logistic",nthread=30,maximize = T,early_stopping_rounds = early_stopping_rounds,colsample_bytree=colsample_bytree,alpha=alpha,lambda=lambda,gamma=gamma,min_child_weight=min_child_weight)
+
+
+predict_=predict(model,model_test_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(selected_variables)  %>% as.matrix(),type="prob")
+
+
+  rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition) %>% mutate(prob=predict_),direction="<")
+  
+  
+  
+  prediction_class=factor(ifelse(predict_  > 0.5,levels[1],levels[2]),levels=levels)
+  #prediction_class=factor(ifelse(predict_$data$prob.LC > 0.5,"LC","C"),levels=c("LC","C"))
+  
+  confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=levels))
+  
+  return(list(model=model,confusion=confusion,training=model_training_df,test=model_test_df,rocfit=rocfit_,predict=predict_))
+
+
+}
+
+
+```
+
+
+
+
+
+
+```{r}
+function_train_boosting_model_cv=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=10,seed=255,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,early_stopping_rounds = 25,nrounds=30,subsample=0.55,colsample_bytree=1,eta=0.01,max.depth=10,matched_variables=c("BDg","age_continuous","sex"),type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull),features_to_include=c(),levels=c("LC","C"),feature_select=F,alpha=0,gamma=0,lambda=1,min_child_weight=1) {
+  
+  type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,bmi,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,bmi,age_continuous),controls = 1,matched_variables = matched_variables) %>% .$filter_df
+  
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+#return(list(training=model_training_df,test=model_test_df))
+  
+  if(is.null(features_to_include) & isFALSE(feature_select)) {
+  selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()    
+  
+  } else if(isFALSE(feature_select)) {
+    
+    selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(one_of(features_to_include)) %>% names() 
+    
+  } else {
+    
+      set.seed(seed)
+  #glmnet.cva=glmnetUtils::cva.glmnet(x=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = 5,family = "binomial", type.measure = "auc")
+  
+  modelf=glmnetUtils::cv.glmnet(x=model_training_df %>% dplyr::select(-(sample:age_continuous)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = 20,family = "binomial",alpha=1, type.measure = "auc",parallel = T)
+  
+  
+  
+  selected_variables=coef(modelf,s="lambda.1se") %>% as.matrix() %>% as.data.frame() %>% rownames_to_column("ID") %>% select(ID,value=2) %>% filter(value != 0,ID != "(Intercept)") %>% pull(ID)
+  print(selected_variables)
+  
+  }
+  
+ 
+dtrain=xgboost::xgb.DMatrix(data=model_training_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(selected_variables) %>% as.matrix(),label = as.numeric(model_training_df$condition) - 1)
+dtest=xgboost::xgb.DMatrix(data=model_test_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(selected_variables)  %>% as.matrix(),label = as.numeric(model_test_df$condition) - 1)
+watchlist = list(train=dtrain,test=dtest)
+#set.seed(seed)
+#bstSparse= xgboost::xgb.train(data=dtrain,max.depth=10,nrounds = 1000,eta=0.01,eval_metric="auc",watchlist = watchlist,subsample=0.4,seed=seed,objective = "binary:logistic",nthread=15,maximize = T)
+
+#cv= xgboost::xgb.cv(data=dtrain,nrounds = nrounds,eval_metric="auc",objective = "binary:logistic",nthread=15,nfold = 5,eta=0.01,max.depth=20)
+
+function_inner_train=function(seed,subsample,alpha,gamma,eta,min_child_weight,max.depth) {
+set.seed(seed)
+model= xgboost::xgb.train(data=dtrain,nrounds = nrounds,eval_metric="auc",verbose = 0,watchlist = watchlist,objective = "binary:logistic",nthread=30,maximize = T,early_stopping_rounds = early_stopping_rounds,colsample_bytree=colsample_bytree,subsample=subsample,alpha=alpha,lambda=lambda,gamma=gamma,min_child_weight=min_child_weight,max.depth=max.depth,eta=eta)
+
+
+predict_=predict(model,model_test_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(selected_variables)  %>% as.matrix(),type="prob")
+
+
+  rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition) %>% mutate(prob=predict_),direction="<")
+  return(list(auc=rocfit_$auc,rocfit=rocfit_))
+  
+}
+
+expand_grid(subsample,alpha,gamma,eta,min_child_weight,max.depth) %>% rowwise() %>% mutate(result=list(function_inner_train(seed=seed,subsample=subsample,alpha=alpha,gamma=gamma,eta=eta,min_child_weight=min_child_weight,max.depth=max.depth))) -> grid_result
+
+  return(grid_result %>%  mutate(seed=seed))
+
+
+}
+
+
+```
+
+
+```{r}
+
+function_to_select_features=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=10,seed=255,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,matched_variables=c("BDg","age_continuous","sex"),type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull),alphas=1,cv=20) {
+  
+     type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1) %>% .$filter_df
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+
+  
+  selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% names()  
+    
+  
+  
+  
+  #5 fold repeated CV to fit the model
+  set.seed(seed)
+  #glmnet.cva=glmnetUtils::cva.glmnet(x=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = 5,family = "binomial", type.measure = "auc")
+  
+  model=glmnetUtils::cv.glmnet(x=model_training_df %>% dplyr::select(one_of(selected_variables)) %>% as.matrix(),y=model_training_df %>% pull(condition),nfolds = cv,family = "binomial",alpha=alphas, type.measure = "auc",parallel = T)
+  
+  
+  
+  selected_features=coef(model,s="lambda.1se") %>% as.matrix() %>% as.data.frame() %>% rownames_to_column("ID") %>% select(ID,value=2) %>% filter(value != 0,ID != "(Intercept)") %>% pull(ID)
+  
+return(selected_features)
+  
+}
+
+```
+
+
+
+```{r}
+function_train_independent_linear_models=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),seed=255,matched_variables=c("BDg","age_continuous","sex"),lc_main_clinical_df=lc_main_clinical_smoking_updated_df,t1=0,t2=10,type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull)) {
+
+  type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,bmi,age_continuous))
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,age_continuous),controls = 1) %>% .$filter_df
+  
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+
+
+model_lm=data_df %>% group_by(ID) %>% do(broom::tidy(lm(vst ~ condition,.))) %>% group_by(term) %>% mutate(padj=p.adjust(p.value)) %>% arrange(padj)
+
+model_glm=data_df %>% group_by(ID) %>% do(broom::tidy(glm(condition ~ vst ,.,family = "binomial"))) %>% group_by(term) %>% mutate(padj=p.adjust(p.value)) %>% arrange(padj)
+
+#model_time=data_df %>% group_by(ID) %>% filter(condition == "LC") %>% do(broom::tidy(lm(time ~ vst + BDg + sex + age_continuous,.))) %>% group_by(term) %>% mutate(padj=p.adjust(p.value)) %>% arrange(padj)
+
+
+#model_c=data_df %>% group_by(ID) %>% do(broom::tidy(rfsrc(Surv(time,status) ~ vst + BDg + sex + age_continuous,.)))
+#model_a=model_training_df %>% group_by(ID) %>% do(broom::tidy(coxph(Surv(time,status) ~ vst + BDg + sex + age_continuous,.)))
+  
+return(list(model_glm=model_glm,model_lm=model_lm))
+
+}
+
+
+
+```
+
+
+```{r test boosting model}
+function_test_boosting_model=function(lc_vst_list_for_all_genes,cancertype_=c("Control"),stage_=c("Control"),seed=255,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,model) {
+  
+
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,bmi,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter(timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  model_test_df=data_df
+  
+#return(list(training=model_training_df,test=model_test_df))
+  
+
+    
+selected_variables = model$feature_names 
+    
+
+
+predict_=predict(model,model_test_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(selected_variables)  %>% as.matrix(),type="prob")
+
+
+  #rocfit_=pROC::roc(condition ~  prob ,data = model_test_df %>% dplyr::select(condition) %>% mutate(prob=predict_),direction="<")
+  
+  
+  
+  #prediction_class=factor(ifelse(predict_  > 0.5,levels[1],levels[2]),levels=levels)
+  #prediction_class=factor(ifelse(predict_$data$prob.LC > 0.5,"LC","C"),levels=c("LC","C"))
+  
+  #confusion=confusionMatrix(prediction_class,factor(model_test_df$condition,levels=levels))
+  
+  return(list(test=model_test_df,predict=predict_))
+
+
+}
+
+
+```
+
+
+```{r roc plot}
+
+function_roc_plot_for_paper=function(grid_result,s=3) {
+  
+grid_result %>% select(model,result) %>% rowwise() %>% mutate(rocfit=list(roc=result$rocfit)) %>% select(-result)  %>% group_by(model) %>% mutate(n=row_number()) %>% ungroup() %>% hoist(rocfit,Specificity="specificities",Sensitivity="sensitivities") %>% unnest(c(Specificity,Sensitivity)) %>% select(-rocfit) -> df
+  
+  
+  annotation_df=grid_result %>% group_by(model) %>% summarise(l=function_confidence_interval(auc)$l,r=function_confidence_interval(auc)$r,m=function_confidence_interval(auc)$m)  %>% mutate(ci=paste0("AUC: ", format(m,digits=2)," (95% CI, ",format(l,digits=2),"-",format(r,digits=2),")")) %>% ungroup()
+  
+  ggplot(df,aes(x=Specificity,y=Sensitivity,group=as.factor(n))) + geom_path(color="gray14") + scale_x_reverse() + theme(legend.position = "none") + facet_grid(.~model) + geom_text(data=annotation_df,aes(x=-Inf,y=-Inf,label=ci,hjust="inward",vjust=-4),size=s,inherit.aes = FALSE) + geom_text(data=annotation_df %>% mutate(l=model),aes(x=Inf,y=Inf,label=l,vjust = "inward", hjust = "inward"),size=3,inherit.aes = F)
+  
+  #+ annotate("text",x=0.35,y=0.05,label=paste("AUC:",annotation),size=4)
+  
+}
+
+
+function_importance_plot_for_paper=function(grid_result,min=4,x=10,do_nothing=F) {
+  
+grid_result %>% select(model,result) %>% rowwise() %>% mutate(importance=list(xgb.importance(model=result$model))) %>% select(-result) %>% unnest(importance) %>% add_count(model,Feature) %>% filter(n >= min) %>% group_by(model,Feature) %>% summarise(Importance=mean(Gain)) %>% arrange(desc(Importance)) %>% top_n(x) %>% mutate(Feature = function_pull_isomir_name(Feature,do_nothing=do_nothing)) %>% mutate(Feature=str_replace_all(Feature,"_","-")) -> df
+  
+
+df %>% ggplot(aes(x=tidytext::reorder_within(Feature,Importance,model),y=Importance)) + geom_col(width=0.25,fill="steelblue4",position = position_dodge(width = 0.1)) + tidytext::scale_x_reordered() + theme(axis.title = element_blank()) + coord_flip() + facet_wrap(.~model,scales="free")
+  #+ annotate("text",x=0.35,y=0.05,label=paste("AUC:",annotation),size=4)
+  
+}
+
+function_importance_table_for_paper=function(grid_result,min=4,x=10,do_nothing=F) {
+  
+grid_result %>% select(model,result) %>% rowwise() %>% mutate(importance=list(xgb.importance(model=result$model))) %>% select(-result) %>% unnest(importance) %>% add_count(model,Feature) %>% filter(n >= min) %>% group_by(model,Feature) %>% summarise(Importance=mean(Gain)) %>% arrange(desc(Importance)) %>% top_n(x) %>% mutate(Feature = function_pull_isomir_name(Feature,do_nothing=do_nothing)) %>% mutate(Feature=str_replace_all(Feature,"_","-")) 
+}
+
+function_importance_table_for_paper_prediagnostic=function(grid_result,min=4,x=10) {
+  
+grid_result %>% group_by(model,t1,t2,subsample) %>% mutate(aucm=mean(auc)) %>% group_by(model,t1,t2) %>% rowwise() %>% mutate(w=paste(t1:t2,collapse = ",")) %>% ungroup() %>% separate_rows(w,sep=",",convert = T) %>% group_by(w,model) %>% filter(aucm==max(aucm)) %>% ungroup() %>% arrange(t1,t2) %>%  rowwise() %>% mutate(importance=list(xgb.importance(model=result$model))) %>% distinct(t1,t2,model,seeds,auc,importance) %>% unnest(importance) %>% distinct() %>% add_count(model,t1,t2,Feature) %>% filter(x>=min) %>% group_by(model,t1,t2,Feature) %>% summarise(Importance=mean(Gain)) %>% arrange(t1,t2,desc(Importance)) %>% top_n(x) %>% mutate(Feature = function_pull_isomir_name(Feature)) %>% mutate(Feature=str_replace_all(Feature,"_","-")) 
+}
+
+function_importance_for_model_rebuilding=function(grid_result,min=4,p=0.5) {
+  
+  grid_result %>% select(model,result) %>% rowwise() %>% mutate(importance=list(xgb.importance(model=result$model))) %>% select(-result) %>% unnest(importance) %>% add_count(model,Feature) %>% filter(n >= 4) %>% group_by(model,Feature) %>% summarise(Importance=mean(Gain)) %>% arrange(desc(Importance)) %>% filter(Importance >= quantile(Importance,probs = p))
+  
+}
+
+```
+
+
+```{r}
+function_train_boosting_model_with_cv=function(lc_vst_list_for_all_genes,cancertype_=c("NSCLC","Control"),stage_=c("Localized","Regional","Distant","Unknown","Control"),t1=0,t2=10,seed=255,lc_main_clinical_df=lc_main_clinical_smoking_updated_df,early_stopping_rounds = 700,nrounds=1000,subsample=0.55,colsample_bytree=1,eta=0.01,max.depth=10,matched_variables=c("BDg","age_continuous","sex"),type_to_exclude=c(),type_to_include=c(rna_ids_types %>% distinct(Type) %>% pull),features_to_include=c(),levels=c("LC","C"),feature_select=F,alpha=0,gamma=0,lambda=1,min_child_weight=1) {
+  
+  type_to_include=setdiff(type_to_include,type_to_exclude)
+  print(type_to_include)
+## Select and match clinical features e.g. age, sex, BDg
+# merge dataset with normalized RNA expression
+  model_data_df=lc_vst_list_for_all_genes %>% map(~.x %>% rownames_to_column("ID") %>% dplyr::mutate(ID=str_replace_all(ID,"-","_")) %>% left_join(rna_ids_types) %>% filter(Type %in% type_to_include) %>% select(-Type) %>% group_by(ID) %>% gather(sample,vst,starts_with("A"))) %>% bind_rows() %>% ungroup() %>% right_join(lc_main_clinical_df %>% dplyr::select(sample,condition,cancertype,metastase,timetodiagnose,diagnosetimeinyears,BDg,sex,bmi,age_continuous)) %>% spread(ID,vst)
+  
+  data_df = model_data_df %>% filter((diagnosetimeinyears < t2 & diagnosetimeinyears >= t1) | timetodiagnose %in% "C",cancertype %in% cancertype_,metastase %in% stage_)
+  
+  
+  
+## 1 to 1 match cases with appropriate controls using optmatch
+# This will balance the dataset with equal number of cases and controls
+  filter_df = function_select_subsample_for_modelling(data_df %>% dplyr::distinct(sample,condition,BDg,sex,bmi,age_continuous),controls = 1,matched_variables = matched_variables) %>% .$filter_df
+  
+  
+  data_df = data_df %>% filter(sample %in% filter_df$sample)
+  set.seed(seed)
+  trainIndex=createDataPartition(data_df  %>% .$condition,p=0.7,times = 1,list=FALSE)
+  model_training_df=data_df[trainIndex,]
+  model_test_df=data_df[-trainIndex,]
+  
+
+    
+    selected_variables = data_df %>% dplyr::select(-(sample:age_continuous)) %>% dplyr::select(one_of(features_to_include)) %>% names() 
+    
+
+
+
+datatrain=model_training_df %>% dplyr::select(condition,selected_variables) %>% dplyr::rename_all(function(x) paste0("X",x)) %>% dplyr::rename(condition=1)
+
+datatest=  model_test_df %>% dplyr::select(condition,selected_variables) %>% dplyr::rename_all(function(x) paste0("X",x)) %>% dplyr::rename(condition=1)
+
+traintask <- mlr::makeClassifTask(data = as.data.frame(datatrain),target = "condition",positive="LC")
+testtask <- mlr::makeClassifTask(data = as.data.frame(datatest),target = "condition",positive="LC")
+
+lrn <- mlr::makeLearner("classif.xgboost",predict.type = "prob")
+lrn$par.vals <- list(    objective="binary:logistic", booster="gbtree",    eval_metric="auc",    nrounds=30)
+
+params <- makeParamSet(     makeDiscreteParam("max_depth",c(3,6,10)),   makeDiscreteParam("min_child_weight",values=c(1,6,2)),    makeDiscreteParam("subsample",values=c(0.3,0.4,0.55,0.7,0.75)), makeDiscreteParam("eta",values=c(0.01,0.05,0.1,0.3)),    makeDiscreteParam("gamma",values=c(1,5,6,10,15)),makeDiscreteParam("alpha",values=c(0.1,0.5,1)),makeDiscreteParam("lambda",values=c(0)))
+
+rdesc <- makeResampleDesc("CV",iters=5,stratify = T)
+ctrl <- makeTuneControlRandom(maxit = 20)
+
+mytune <- tuneParams(learner = lrn ,task = traintask,measures = list(mlr::auc),resampling = rdesc,par.set = params,control = ctrl,show.info = T)
+
+#lrn_tune=setHyperPars(lrn,par.vals = mytune$x)
+
+#model=mlr::train(learner = lrn_tune,task = traintask)
+#predict_=predict(model,testtask)
+
+
+  return(list(predict=traintask))
+
+
+}
+
+
+```
+
+
+
+
+```{r}
+
+function_pull_isomir_name=function(ids,do_nothing=F) {
+  
+  pull_f=function(x) {
+    
+    if(x %in% isomir.reference.table.v22$sequence) {
+      
+     x=isomir.reference.table.v22 %>% filter(sequence %in% x) %>% mutate(name=paste0(MiRBase.ID,"*")) %>% pull(name) 
+     
+     return(unlist(x))
+    
+      
+    } else if(x %in% trna_names$ID) {
+      
+      x=trna_names %>% filter(ID %in% x) %>% pull(Type) 
+      
+      return(unlist(x))
+      
+    } else {return(x)}
+   
+    
+  }
+  
+  if (do_nothing == F) {
+  
+    ids %>% map(~pull_f(.x)) %>% unlist()  
+  } else {
+    
+    ids  
+    
+  }
+  
+}
+  
+  
+
+```
+
+
+
+```{r}
+function_test_final_models=function(seed_=255,t1 = 0,t2 = 10,alpha_=0.1,type_index_=T,cancertype = c("SCLC","Control")){
+  
+  
+  return(function_train_sparse_group_lasso_model(lc_vst_list_for_all_genes,cancertype_ = cancertype,t1 = t1,t2 = t2,seed = seed_,type_index = type_index_,alpha = alpha_ ,lc_main_clinical_df = lc_main_clinical_smoking_updated_df,matched_variables_ = c("BDg","age_continuous","sex")))
+  
+}
+
+
+```
