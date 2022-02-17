@@ -1,5 +1,5 @@
 # Lung Cancer analyses scripts
-Lung Cancer scripts
+Lung Cancer scripts version 1.0
 
 Introduction
 ------------
